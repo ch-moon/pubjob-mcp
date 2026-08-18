@@ -3,7 +3,8 @@
 나라일터(인사혁신처) + 잡알리오(공공기관 채용공시) **이중 소스** 공공채용 검색 MCP 서버.
 
 Claude 등 MCP 클라이언트에서 국가·지방공무원, 공공기관, 교육청 채용공고를 검색하고
-자격요건·전형절차·첨부파일까지 조회할 수 있다.
+자격요건·전형절차·첨부파일까지 조회할 수 있다. NCS 국가직무능력표준 조회 도구를 갖춰
+공고의 NCS 직무분야에서 수행준거·지식·기술·태도, 연계 자격증까지 이어서 분석할 수 있다.
 
 ## 도구
 
@@ -15,6 +16,10 @@ Claude 등 MCP 클라이언트에서 국가·지방공무원, 공공기관, 교�
 | `search_alio_jobs` | 잡알리오 | 채용공시 검색 (제목 키워드·고용형태·NCS 직무·채용구분·기관유형·지역 필터, 진행 중 공고 필터) |
 | `get_alio_job_detail` | 잡알리오 | 공시 상세 조회 (자격요건·우대·결격·전형절차·단계별 경쟁률·첨부파일·원문링크) |
 | `fetch_job_document` | 공통 | 첨부파일(HWP·HWPX·PDF·DOCX) 다운로드 후 본문 텍스트 추출 (표 안 텍스트 포함, 10MB·3만 자 상한) |
+| `ncs_find_duty` | NCS | 키워드로 세분류(직무) 검색 — 분류명·능력단위명 부분일치, 쉼표 OR (전체 표준을 로컬 캐시 후 검색) |
+| `ncs_duty_overview` | NCS | 세분류의 직무정의 + 능력단위 목록(정의·수준·ncsClCd) |
+| `ncs_analyze_unit` | NCS | 능력단위 상세 분석 — 요소별 수행준거·지식·기술·태도 + 직업기초능력 (옵션: 출제기준·평가지침) |
+| `ncs_related_quals` | NCS | 능력단위와 연계된 국가기술자격 종목 조회 (일 1000건 제한이라 결과 캐시) |
 
 기관구분·고용형태·NCS 등 검색 코드표는 각 도구의 docstring에 포함되어 있어
 MCP 클라이언트(LLM)가 바로 활용할 수 있다.
@@ -40,6 +45,11 @@ ALIO_API_KEY=잡알리오_인증키
 |---|---|
 | `PUBJOB_API_KEY` | [공공데이터포털(data.go.kr)](https://www.data.go.kr)에서 **"인사혁신처 공직 채용정보"** 검색 → 활용신청 |
 | `ALIO_API_KEY` | [잡알리오(job.alio.go.kr)](https://job.alio.go.kr) OpenAPI 메뉴에서 인증키 신청 |
+
+NCS 도구는 `PUBJOB_API_KEY`를 재사용한다 (같은 data.go.kr 키. 단, **"한국산업인력공단 NCS"**
+관련 API 두 건 — ncsInfo, 자격 연계 — 의 활용신청이 같은 계정에 있어야 한다).
+`ncs_find_duty` 최초 호출 시 NCS 전체 분류·능력단위(약 1.4만 건)를 API 16회 호출로 내려받아
+`ncs_cache.json`(약 1.6MB)을 만들고, 이후엔 캐시에서 검색한다.
 
 ### 동작 확인
 
@@ -100,6 +110,16 @@ claude mcp add pubjob -- uv run --directory /path/to/pubjob-mcp python main.py
    (Encoding/Decoding 키 어느 쪽을 넣어도 동작).
 6. **`Kwrd` 키워드 파라미터가 서버에서 무시됨** — 어떤 키워드를 보내도 totalCount가
    동일하게 반환된다. 키워드 검색이 필요하면 전체 목록을 받아 로컬 필터링할 것.
+
+### NCS (apis.data.go.kr/B490007)
+
+7. **`returnType=json`이 사실상 필수** — 명세상 기본 응답은 XML이지만, returnType 없이
+   호출하면 `code=009 (필수 파라미터를 확인하여 주십시요)`가 돌아온다. json은 정상 동작.
+8. **`ncsSetqInfo`/`ncsEvalInfo`는 응답 구조가 다름** — 다른 엔드포인트의 `data`는
+   배열인데 이 둘은 객체(`evalData`/`timeData`/`equipData` 하위 배열)다. 페이징 정보도 없다.
+9. **자격 연계 API(ncsClCdJm)는 완전히 다른 규격** — 응답 envelope가 `data`/`dataInfo`가
+   아니라 data.go.kr 표준(`header`/`body.items`)이고, 파라미터도 `returnType`이 아닌
+   `dataFormat`이며, 페이지당 50건을 넘기면 `resultCode=930`으로 거부한다.
 
 ## 기술 스택
 

@@ -8,13 +8,14 @@
 인증키는 환경변수 PUBJOB_API_KEY에서 읽는다 (.env 파일 지원).
 """
 
+import asyncio
 import json
 import os
 import re
 import tempfile
 import zipfile
 import zlib
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -737,6 +738,385 @@ async def fetch_job_document(file_url: str) -> str:
             os.remove(path)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# NCS 국가직무능력표준 (apis.data.go.kr/B490007)
+# ---------------------------------------------------------------------------
+
+NCS_BASE_URL = "https://apis.data.go.kr/B490007/ncsInfo"
+NCS_JM_URL = "https://apis.data.go.kr/B490007/ncsClCdJm/getNcsClCdJmList"
+NCS_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ncs_cache.json")
+
+
+def _ncs_key() -> str | None:
+    key = os.environ.get("PUBJOB_API_KEY")  # 같은 data.go.kr 계정 키 재사용
+    if key and "%" in key:
+        key = unquote(key)
+    return key
+
+
+async def _call_ncs(path: str, params: dict[str, Any]) -> dict[str, Any] | str:
+    """ncsInfo API 호출. 성공 시 전체 JSON(dict), 실패 시 에러 메시지(str) 반환.
+
+    명세와 달리 returnType=json이 사실상 필수다 (없으면 code=009).
+    """
+    key = _ncs_key()
+    if not key:
+        return "오류: 환경변수 PUBJOB_API_KEY가 비어 있습니다."
+    query = {"serviceKey": key, "returnType": "json", **params}
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(f"{NCS_BASE_URL}{path}", params=query)
+            resp.raise_for_status()
+        data = resp.json()
+    except httpx.TimeoutException:
+        return "오류: NCS API 응답이 10초를 초과했습니다."
+    except httpx.HTTPError as e:
+        return f"오류: NCS API 요청 실패 - {e}"
+    except ValueError:
+        return f"오류: NCS API JSON 파싱 실패 / 응답 일부: {resp.text[:200]}"
+    info = data.get("dataInfo") or {}
+    if info.get("code") not in (None, "000"):
+        return f"오류: NCS API 실패 응답 (code={info.get('code')}, message={info.get('message')})"
+    return data
+
+
+def _ncs_load_cache() -> dict[str, Any]:
+    try:
+        with open(NCS_CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _ncs_save_cache(cache: dict[str, Any]) -> None:
+    with open(NCS_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False)
+
+
+async def _ncs_fetch_all(path: str, extract: Any) -> tuple[list[Any], int] | str:
+    """엔드포인트 전체를 페이지 순회로 수집한다. (rows, 호출수) 또는 에러 메시지."""
+    rows: list[Any] = []
+    calls = 0
+    num_rows = 1000
+    page = 1
+    while True:
+        data = await _call_ncs(path, {"numOfRows": str(num_rows), "pageNo": str(page)})
+        calls += 1
+        if isinstance(data, str):
+            if num_rows == 1000 and page == 1:  # 1000행이 거부되면 100행으로 재시도
+                num_rows = 100
+                continue
+            return data
+        batch = data.get("data") or []
+        rows.extend(extract(r) for r in batch)
+        total = int((data.get("dataInfo") or {}).get("totCnt") or 0)
+        if not batch or len(rows) >= total or page > 200:
+            return rows, calls
+        page += 1
+
+
+async def _ncs_ensure_cache() -> dict[str, Any] | str:
+    """분류(ncsCdInfo)·능력단위(ncsCompeUnitInfo) 전체를 캐시. 있으면 그대로 반환."""
+    cache = _ncs_load_cache()
+    if cache.get("classifications") and cache.get("units"):
+        return cache
+
+    cls_result = await _ncs_fetch_all(
+        "/ncsCdInfo",
+        lambda r: {
+            "dutyCd": f"{r.get('ncsLclasCd')}{r.get('ncsMclasCd')}{r.get('ncsSclasCd')}{r.get('ncsSubdCd')}",
+            "path": f"{r.get('ncsLclasCdNm')} > {r.get('ncsMclasCdNm')} > {r.get('ncsSclasCdNm')} > {r.get('ncsSubdCdNm')}",
+            "names": [r.get("ncsLclasCdNm"), r.get("ncsMclasCdNm"), r.get("ncsSclasCdNm"), r.get("ncsSubdCdNm")],
+        },
+    )
+    if isinstance(cls_result, str):
+        return cls_result
+    classifications, cls_calls = cls_result
+
+    unit_result = await _ncs_fetch_all(
+        "/ncsCompeUnitInfo",
+        lambda r: {
+            "dutyCd": r.get("dutyCd"),
+            "compUnitCd": r.get("compUnitCd"),
+            "name": re.sub(r"^\d+\.", "", r.get("compUnitName") or ""),
+            "level": r.get("compUnitLevel"),
+            "ncsClCd": r.get("ncsClCd"),
+        },
+    )
+    if isinstance(unit_result, str):
+        return unit_result
+    unit_rows, unit_calls = unit_result
+
+    units: dict[str, list[dict[str, Any]]] = {}
+    for u in unit_rows:
+        units.setdefault(u.pop("dutyCd") or "", []).append(u)
+
+    cache = {
+        "meta": {
+            "built_at": datetime.now().isoformat(timespec="seconds"),
+            "calls_used": cls_calls + unit_calls,
+            "classification_count": len(classifications),
+            "unit_count": len(unit_rows),
+        },
+        "classifications": classifications,
+        "units": units,
+        "related_quals": cache.get("related_quals", {}),
+    }
+    _ncs_save_cache(cache)
+    return cache
+
+
+@mcp.tool()
+async def ncs_find_duty(keyword: str) -> str:
+    """키워드로 NCS 세분류(직무)를 찾는다. 대/중/소/세분류명과 능력단위명에서 부분일치 검색.
+
+    최초 호출 시 전체 분류·능력단위를 내려받아 로컬 캐시(ncs_cache.json)를 만든다.
+
+    Args:
+        keyword: 검색 키워드. 쉼표로 구분하면 OR 검색 (예: "프로젝트관리,사업기획")
+    """
+    cache = await _ncs_ensure_cache()
+    if isinstance(cache, str):
+        return cache
+
+    keywords = [k.strip() for k in keyword.split(",") if k.strip()]
+    if not keywords:
+        return "오류: 검색 키워드를 입력하세요."
+
+    matched: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for c in cache["classifications"]:
+        units = cache["units"].get(c["dutyCd"], [])
+        name_hit = any(kw in (n or "") for kw in keywords for n in c["names"])
+        unit_hit = any(kw in (u["name"] or "") for kw in keywords for u in units)
+        if name_hit or unit_hit:
+            matched.append((c, units))
+
+    if not matched:
+        return f"검색 결과 없음 (키워드: {keyword})"
+
+    lines = [f"[NCS 직무 검색] 키워드: {keyword} / {len(matched)}개 세분류 매칭"]
+    shown = matched[:15]
+    for c, units in shown:
+        lines.append(f"\n■ {c['path']} (dutyCd={c['dutyCd']})")
+        for u in units:
+            lines.append(f"  - [{u['compUnitCd']}] {u['name']} (수준 {u['level']}, ncsClCd={u['ncsClCd']})")
+        if not units:
+            lines.append("  (능력단위 정보 없음)")
+    if len(matched) > len(shown):
+        lines.append(f"\n… 외 {len(matched) - len(shown)}개 세분류 생략. 키워드를 좁혀서 다시 검색하세요.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def ncs_duty_overview(duty_cd: str) -> str:
+    """NCS 세분류(직무)의 직무정의와 능력단위 목록을 조회한다.
+
+    Args:
+        duty_cd: 8자리 세분류 코드 (예: "01010102", ncs_find_duty 결과의 dutyCd)
+    """
+    duty_data, unit_data = await asyncio.gather(
+        _call_ncs("/ncsDutyInfo", {"dutyCd": duty_cd, "numOfRows": "10", "pageNo": "1"}),
+        _call_ncs("/ncsCompeUnitInfo", {"dutyCd": duty_cd, "numOfRows": "100", "pageNo": "1"}),
+    )
+
+    lines = [f"[NCS 직무 개요] dutyCd={duty_cd}"]
+    if isinstance(duty_data, str):
+        lines.append(duty_data)
+    else:
+        for d in duty_data.get("data") or []:
+            lines.append(f"직무명: {d.get('dutyNm')}")
+            lines.append(f"직무정의: {d.get('dutyDef')}")
+
+    lines.append("\n--- 능력단위 목록 ---")
+    if isinstance(unit_data, str):
+        lines.append(unit_data)
+    else:
+        units = unit_data.get("data") or []
+        if not units:
+            lines.append(f"능력단위 없음 (dutyCd={duty_cd} 확인 필요)")
+        for u in units:
+            lines.append(
+                f"[{u.get('compUnitCd')}] {u.get('compUnitName')} "
+                f"(수준 {u.get('compUnitLevel')}, ncsClCd={u.get('ncsClCd')})"
+            )
+            if u.get("compUnitDef"):
+                lines.append(f"    {u['compUnitDef']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def ncs_analyze_unit(duty_cd: str, comp_unit_cd: str, include_exam: bool = False) -> str:
+    """NCS 능력단위 1개를 분석한다: 능력단위요소별 수행준거·지식·기술·태도 + 직업기초능력.
+
+    자기소개서·면접 준비, 직무기술서 해석에 필요한 상세 기준을 구조화해 반환한다.
+
+    Args:
+        duty_cd: 8자리 세분류 코드 (예: "01010102")
+        comp_unit_cd: 2자리 능력단위 코드 (예: "01")
+        include_exam: True면 출제기준(평가방법·시험시간·장비)과 평가지침도 포함
+    """
+    unit = {"dutyCd": duty_cd, "compUnitCd": comp_unit_cd, "pageNo": "1"}
+    tasks = [
+        _call_ncs("/ncsCompeUnitFactrInfo", {**unit, "numOfRows": "100"}),
+        _call_ncs("/ncsKsaInfo", {**unit, "numOfRows": "1000"}),
+        _call_ncs("/ncsjobInfo", {**unit, "numOfRows": "1000"}),
+    ]
+    if include_exam:
+        tasks += [
+            _call_ncs("/ncsSetqInfo", {**unit, "numOfRows": "100"}),
+            _call_ncs("/ncsEvalInfo", {**unit, "numOfRows": "100"}),
+        ]
+    results = await asyncio.gather(*tasks)
+    factr_data, ksa_data, job_data = results[0], results[1], results[2]
+
+    lines = [f"[NCS 능력단위 분석] dutyCd={duty_cd} / compUnitCd={comp_unit_cd}"]
+
+    factors: list[dict[str, Any]] = []
+    if isinstance(factr_data, str):
+        lines.append(f"능력단위요소: {factr_data}")
+    else:
+        factors = factr_data.get("data") or []
+        if factors:
+            f0 = factors[0]
+            lines.append(f"능력단위: {f0.get('compUnitName')} (수준 {f0.get('compUnitLevel')}, ncsClCd={f0.get('ncsClCd')})")
+
+    # KSA 행을 (요소번호, 구분명)으로 묶는다. gbnName: 수행준거/지식/기술/태도
+    ksa_by_factor: dict[Any, dict[str, list[str]]] = {}
+    if isinstance(ksa_data, str):
+        lines.append(f"수행준거·KSA: {ksa_data}")
+    else:
+        for row in ksa_data.get("data") or []:
+            grp = ksa_by_factor.setdefault(row.get("compUnitFactrNo"), {})
+            grp.setdefault(row.get("gbnName") or "기타", []).append(row.get("gbnVal") or "")
+
+    for f in factors:
+        no = f.get("compUnitFactrNo")
+        lines.append(f"\n■ 요소 {f.get('compUnitFactrName')}")
+        grp = ksa_by_factor.get(no, {})
+        for gbn in ("수행준거", "지식", "기술", "태도"):
+            vals = grp.pop(gbn, [])
+            if vals:
+                lines.append(f"  [{gbn}]")
+                lines.extend(f"  - {v}" for v in vals)
+        for gbn, vals in grp.items():  # 예상 밖 구분값도 누락 없이 표시
+            lines.append(f"  [{gbn}]")
+            lines.extend(f"  - {v}" for v in vals)
+
+    lines.append("\n--- 직업기초능력 ---")
+    if isinstance(job_data, str):
+        lines.append(job_data)
+    else:
+        mains: dict[str, list[str]] = {}
+        for row in job_data.get("data") or []:
+            mains.setdefault(row.get("mainName") or "", []).append(row.get("subName") or "")
+        if not mains:
+            lines.append("정보 없음")
+        for main, subs in mains.items():
+            lines.append(f"- {main}: {', '.join(subs)}")
+
+    if include_exam:
+        setq_data, eval_data = results[3], results[4]
+        lines.append("\n--- 출제기준 ---")
+        if isinstance(setq_data, str):
+            lines.append(setq_data)
+        else:
+            d = setq_data.get("data") or {}
+            for e in d.get("evalData") or []:
+                lines.append(f"- 평가방법: {e.get('evalMethDstinName')} / {e.get('evalMethName')}")
+            for t in d.get("timeData") or []:
+                lines.append(f"- 시험시간: 지필 {t.get('papenEvalTime')}분, 실무 {t.get('pracbizEvalTime')}분")
+            equips = [e.get("equipName") for e in d.get("equipData") or [] if e.get("equipName")]
+            if equips:
+                lines.append(f"- 시설·장비: {', '.join(equips)}")
+        lines.append("\n--- 평가지침 ---")
+        if isinstance(eval_data, str):
+            lines.append(eval_data)
+        else:
+            d = eval_data.get("data") or {}
+            seen: set[tuple[Any, Any]] = set()
+            for e in d.get("evalData") or []:
+                key = (e.get("evalTypeName"), e.get("evalMethName"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                desc = f" — {e.get('evalDesc')}" if e.get("evalDesc") else ""
+                lines.append(f"- {e.get('evalTypeName')} / {e.get('evalMethName')}{desc}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def ncs_related_quals(ncs_cl_cd: str) -> str:
+    """NCS 능력단위와 연계된 국가기술자격 종목 목록을 조회한다. 결과는 캐시된다(일 1000건 제한).
+
+    Args:
+        ncs_cl_cd: 능력단위 풀코드+버전 (형식: 세분류8자리+능력단위2자리_차수v버전,
+            예: "0101010201_17v2" — ncs_find_duty/ncs_duty_overview 결과의 ncsClCd 값 그대로)
+    """
+    if not re.fullmatch(r"\d{10}_\d+v\d+", ncs_cl_cd):
+        return (
+            f"오류: ncs_cl_cd 형식이 잘못되었습니다 ({ncs_cl_cd}). "
+            "'0101010201_17v2' 형식이어야 합니다 (ncsClCd 값을 그대로 사용)."
+        )
+
+    cache = _ncs_load_cache()
+    items = cache.get("related_quals", {}).get(ncs_cl_cd)
+    from_cache = items is not None
+
+    if items is None:
+        key = _ncs_key()
+        if not key:
+            return "오류: 환경변수 PUBJOB_API_KEY가 비어 있습니다."
+        items = []
+        page = 1
+        while True:  # 페이지당 최대 50건 제한(resultCode=930)이 있어 순회 수집
+            try:
+                async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                    resp = await client.get(
+                        NCS_JM_URL,
+                        params={
+                            "serviceKey": key,
+                            "dataFormat": "json",
+                            "numOfRows": "50",
+                            "pageNo": str(page),
+                            "ncsClCd": ncs_cl_cd,
+                        },
+                    )
+                    resp.raise_for_status()
+                data = resp.json()
+            except httpx.TimeoutException:
+                return "오류: NCS 자격 API 응답이 10초를 초과했습니다."
+            except httpx.HTTPError as e:
+                return f"오류: NCS 자격 API 요청 실패 - {e}"
+            except ValueError:
+                return f"오류: NCS 자격 API JSON 파싱 실패 / 응답 일부: {resp.text[:200]}"
+
+            header = data.get("header") or {}
+            if header.get("resultCode") != "00":
+                return f"오류: NCS 자격 API 실패 응답 (resultCode={header.get('resultCode')}, resultMsg={header.get('resultMsg')})"
+            body = data.get("body") or {}
+            batch = body.get("items") or []
+            if isinstance(batch, dict):
+                batch = [batch]
+            items.extend(batch)
+            total = int(body.get("totalCount") or 0)
+            if not batch or len(items) >= total or page > 40:
+                break
+            page += 1
+        cache.setdefault("related_quals", {})[ncs_cl_cd] = items
+        _ncs_save_cache(cache)
+
+    if not items:
+        return f"연계 자격 없음 (ncsClCd={ncs_cl_cd})"
+
+    lines = [f"[연계 국가기술자격] ncsClCd={ncs_cl_cd} / {len(items)}건" + (" (캐시)" if from_cache else "")]
+    for it in items:
+        lines.append(
+            f"- [{it.get('jmCd')}] {it.get('jmNm')} | {it.get('abltUnitTypNm')} | "
+            f"시험기관: {it.get('examInstiNm')} | 능력단위 표준시간: {it.get('minEduTrngTm')}h"
+        )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
