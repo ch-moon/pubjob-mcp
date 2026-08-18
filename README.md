@@ -82,6 +82,13 @@ claude mcp add pubjob -- uv run --directory /path/to/pubjob-mcp python main.py
 
 > Windows PowerShell 5.1은 `--` 구분자를 삼켜버리므로 cmd나 Git Bash에서 실행할 것.
 
+## 직무분석 스킬
+
+`skills/job-analysis/SKILL.md` (**v4**) — 공고 선택 → 첨부 전수 추출 → NCS 표준 매핑 →
+직무분석표 생성까지의 워크플로 정의. 산출물은 NCS를 전혀 모르는 독자를 위한 제3자
+공개용 완전 참조문서로 작성한다 (쉬운 요약, 8단계 사다리 앵커, 실제 업무 장면,
+직업기초능력 해석 의무, 코드류는 부록 격리 등).
+
 ## Known API quirks
 
 공식 명세와 실서버 동작이 다른 지점들. 이 저장소의 코드는 전부 실호출로 검증하며 대응해두었다.
