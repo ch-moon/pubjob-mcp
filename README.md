@@ -84,10 +84,12 @@ claude mcp add pubjob -- uv run --directory /path/to/pubjob-mcp python main.py
 
 ## 직무분석 스킬
 
-`skills/job-analysis/SKILL.md` (**v4**) — 공고 선택 → 첨부 전수 추출 → NCS 표준 매핑 →
+`skills/job-analysis/SKILL.md` (**v5**) — 공고 선택 → 첨부 전수 추출 → NCS 표준 매핑 →
 직무분석표 생성까지의 워크플로 정의. 산출물은 NCS를 전혀 모르는 독자를 위한 제3자
 공개용 완전 참조문서로 작성한다 (쉬운 요약, 8단계 사다리 앵커, 실제 업무 장면,
-직업기초능력 해석 의무, 코드류는 부록 격리 등).
+직업공통능력(구 직업기초능력) 신구 이중체계 병기·해석 의무, 코드류는 부록 격리 등).
+신구 매핑 근거는 `skills/job-analysis/references/직업공통능력_표준_2025.md`
+(한국산업인력공단 2025.12 개편 표준, 7영역×하위능력×평가준거).
 
 ## Known API quirks
 
@@ -127,6 +129,10 @@ claude mcp add pubjob -- uv run --directory /path/to/pubjob-mcp python main.py
 9. **자격 연계 API(ncsClCdJm)는 완전히 다른 규격** — 응답 envelope가 `data`/`dataInfo`가
    아니라 data.go.kr 표준(`header`/`body.items`)이고, 파라미터도 `returnType`이 아닌
    `dataFormat`이며, 페이지당 50건을 넘기면 `resultCode=930`으로 거부한다.
+10. **`/ncsjobInfo`의 직업기초능력 데이터는 2025.12 개편 전 구체계(10영역) 기준** —
+    2025.12에 직업공통능력(7영역)으로 전면 개편됐지만 API와 각 기관 직무기술서는
+    아직 구체계를 반환/사용하는 전환기다. 신체계 매핑은 본 저장소 스킬의
+    `skills/job-analysis/references/직업공통능력_표준_2025.md` 대조표로 수행한다.
 
 ## 기술 스택
 
