@@ -14,6 +14,7 @@ Claude 등 MCP 클라이언트에서 국가·지방공무원, 공공기관, 교�
 | `get_job_files` | 나라일터 | 공고 첨부파일 목록·다운로드 정보 |
 | `search_alio_jobs` | 잡알리오 | 채용공시 검색 (제목 키워드·고용형태·NCS 직무·채용구분·기관유형·지역 필터, 진행 중 공고 필터) |
 | `get_alio_job_detail` | 잡알리오 | 공시 상세 조회 (자격요건·우대·결격·전형절차·단계별 경쟁률·첨부파일·원문링크) |
+| `fetch_job_document` | 공통 | 첨부파일(HWP·HWPX·PDF·DOCX) 다운로드 후 본문 텍스트 추출 (표 안 텍스트 포함, 10MB·3만 자 상한) |
 
 기관구분·고용형태·NCS 등 검색 코드표는 각 도구의 docstring에 포함되어 있어
 MCP 클라이언트(LLM)가 바로 활용할 수 있다.
@@ -85,13 +86,19 @@ claude mcp add pubjob -- uv run --directory /path/to/pubjob-mcp python main.py
    `resultCode=200, resultMsg=성공했습니다.`를 반환한다. 본 코드는 0/200을 모두 성공으로 처리.
 3. **GET 미지원** — 명세상 파라미터는 전부 query string이지만 메서드는 POST만 받는다.
    GET으로 보내면 HTTP 405 (`Request method 'GET' not supported`) HTML 페이지가 돌아온다.
+4. **첨부파일 다운로드 URL 일부가 파일 대신 HTML 페이지를 반환** — 상세 응답 `files[].url`이
+   `opendata.alio.go.kr/recruit/downloadAtchFile?recrutAtchFileNo=N` 패턴이면 200 OK로
+   웹페이지 HTML이 돌아온다. 같은 번호를
+   `www.alio.go.kr/download/download.json?fileNo=N`으로 바꾸면 실제 파일이 내려온다.
+   `fetch_job_document`가 이 변환을 자동으로 수행한다.
+   (덤: 이 서버의 Content-Disposition은 `filename=""이름"";`처럼 따옴표를 겹쳐 보낸다.)
 
 ### 나라일터 (apis.data.go.kr/1760000/PblJobService)
 
-4. **Encoding 인증키를 그대로 쓰면 403** — HTTP 클라이언트가 `serviceKey`를 다시
+5. **Encoding 인증키를 그대로 쓰면 403** — HTTP 클라이언트가 `serviceKey`를 다시
    인코딩해 이중 인코딩이 되기 때문. 본 코드는 키에 `%`가 있으면 자동으로 디코딩 후 전송한다
    (Encoding/Decoding 키 어느 쪽을 넣어도 동작).
-5. **`Kwrd` 키워드 파라미터가 서버에서 무시됨** — 어떤 키워드를 보내도 totalCount가
+6. **`Kwrd` 키워드 파라미터가 서버에서 무시됨** — 어떤 키워드를 보내도 totalCount가
    동일하게 반환된다. 키워드 검색이 필요하면 전체 목록을 받아 로컬 필터링할 것.
 
 ## 기술 스택
@@ -99,4 +106,5 @@ claude mcp add pubjob -- uv run --directory /path/to/pubjob-mcp python main.py
 - Python 3.13 / [uv](https://docs.astral.sh/uv/)
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) 2.0 (`MCPServer`, stdio)
 - httpx (비동기, 10초 타임아웃) / xmltodict (나라일터 XML 파싱)
+- olefile (HWP 5.0 BodyText 레코드 직접 파싱) / pypdf / python-docx (첨부 문서 텍스트 추출)
 - 모든 오류는 예외 대신 `resultMsg`를 포함한 안내 메시지로 반환 — LLM이 스스로 재시도·조정 가능

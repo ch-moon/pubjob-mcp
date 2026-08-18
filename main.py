@@ -10,6 +10,10 @@
 
 import json
 import os
+import re
+import tempfile
+import zipfile
+import zlib
 from datetime import date, timedelta
 from typing import Any
 from urllib.parse import quote, unquote
@@ -472,6 +476,267 @@ async def get_alio_job_detail(sn: int) -> str:
     if item.get("srcUrl"):
         lines.append(f"원문링크: {item['srcUrl']}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 첨부파일 텍스트 추출
+# ---------------------------------------------------------------------------
+
+DOC_TIMEOUT = 30.0
+DOC_MAX_BYTES = 10 * 1024 * 1024  # 10MB
+DOC_MAX_CHARS = 30_000
+
+# HWP 5.0 인라인 컨트롤 중 8워드(16바이트)를 차지하는 확장 컨트롤 코드
+_HWP_EXTENDED_CTRL = {1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23}
+
+
+def _normalize_doc_url(url: str) -> str:
+    """알리오 opendata 다운로드 URL은 파일 대신 HTML 페이지를 반환하므로
+    실제 파일을 주는 www.alio.go.kr 패턴으로 변환한다."""
+    m = re.match(
+        r"https?://opendata\.alio\.go\.kr/recruit/downloadAtchFile\?recrutAtchFileNo=(\d+)",
+        url,
+    )
+    if m:
+        return f"https://www.alio.go.kr/download/download.json?fileNo={m.group(1)}"
+    return url
+
+
+async def _download_doc(url: str) -> tuple[str, str]:
+    """파일을 임시폴더에 내려받아 (경로, 파일명 힌트)를 반환한다. 10MB 상한."""
+    async with httpx.AsyncClient(timeout=DOC_TIMEOUT, follow_redirects=True) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            length = resp.headers.get("content-length")
+            if length and int(length) > DOC_MAX_BYTES:
+                raise ValueError(f"파일이 10MB를 초과합니다 ({int(length):,} bytes)")
+
+            # Content-Disposition에서 파일명 힌트 추출 (확장자 판별 보조용)
+            filename = ""
+            cd = resp.headers.get("content-disposition", "")
+            m = re.search(r"filename\*=(?:UTF-8''|utf-8'')([^;]+)", cd)
+            if not m:
+                # 알리오는 filename=""이름""; 처럼 따옴표를 겹쳐 보내는 경우가 있다
+                m = re.search(r'filename="*([^";]+)"*', cd)
+            if m:
+                filename = unquote(m.group(1).strip())
+
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > DOC_MAX_BYTES:
+                    raise ValueError("파일이 10MB를 초과합니다 (수신 중단)")
+                chunks.append(chunk)
+
+    fd, path = tempfile.mkstemp(prefix="pubjob_doc_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"".join(chunks))
+    return path, filename
+
+
+def _detect_doc_format(path: str, filename_hint: str) -> str | None:
+    """매직 바이트 우선, 파일명 확장자 보조로 문서 형식을 판별한다."""
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):  # OLE 컨테이너 (hwp/doc 공용)
+        return "hwp"
+    if head.startswith(b"PK"):  # ZIP 컨테이너 (hwpx/docx 공용) — 내용물로 구분
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+        except zipfile.BadZipFile:
+            return None
+        if any(n.startswith("word/") for n in names):
+            return "docx"
+        if any(n.startswith("Contents/section") for n in names):
+            return "hwpx"
+        return None
+    ext = os.path.splitext(filename_hint)[1].lower().lstrip(".")
+    return ext if ext in ("hwp", "hwpx", "pdf", "docx") else None
+
+
+def _extract_hwp(path: str) -> str:
+    """HWP 5.0(OLE)의 BodyText 섹션을 zlib 해제 후 PARA_TEXT 레코드에서 텍스트 추출.
+
+    표 셀 문단도 개별 PARA_TEXT 레코드로 저장되므로 표 안 텍스트가 함께 추출된다.
+    """
+    import olefile
+
+    ole = olefile.OleFileIO(path)
+    try:
+        if not ole.exists("FileHeader"):
+            raise ValueError("FileHeader 스트림이 없어 HWP 5.0 형식이 아닙니다")
+        flags = int.from_bytes(ole.openstream("FileHeader").read()[36:40], "little")
+        if flags & 0x02:
+            raise ValueError("암호화(배포용) HWP 문서는 지원하지 않습니다")
+        compressed = bool(flags & 0x01)
+
+        sections = sorted(
+            (e for e in ole.listdir() if e[0] == "BodyText"),
+            key=lambda e: int(e[1].replace("Section", "")),
+        )
+        if not sections:
+            raise ValueError("BodyText 섹션이 없습니다")
+
+        out: list[str] = []
+        for entry in sections:
+            data = ole.openstream(entry).read()
+            if compressed:
+                data = zlib.decompress(data, -15)
+            i = 0
+            while i + 4 <= len(data):
+                rec = int.from_bytes(data[i : i + 4], "little")
+                tag = rec & 0x3FF
+                size = (rec >> 20) & 0xFFF
+                i += 4
+                if size == 0xFFF:  # 확장 크기
+                    size = int.from_bytes(data[i : i + 4], "little")
+                    i += 4
+                if tag == 67:  # HWPTAG_PARA_TEXT
+                    chunk = data[i : i + size]
+                    j = 0
+                    buf: list[str] = []
+                    while j + 2 <= len(chunk):
+                        code = int.from_bytes(chunk[j : j + 2], "little")
+                        if code in _HWP_EXTENDED_CTRL:
+                            j += 16  # 확장 컨트롤은 8워드를 차지
+                        elif code < 32:
+                            if code in (10, 13):
+                                buf.append("\n")
+                            j += 2
+                        else:
+                            buf.append(chr(code))
+                            j += 2
+                    text = "".join(buf).strip()
+                    if text:
+                        out.append(text)
+                i += size
+        joined = "\n".join(out)
+        # UTF-16 서로게이트 쌍(BMP 밖 문자) 복원
+        return joined.encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
+    finally:
+        ole.close()
+
+
+def _extract_hwpx(path: str) -> str:
+    """HWPX(zip)의 Contents/section*.xml에서 문단 단위로 텍스트 추출. 표 셀 포함."""
+    import xml.etree.ElementTree as ET
+
+    parts: list[str] = []
+    with zipfile.ZipFile(path) as zf:
+        names = sorted(n for n in zf.namelist() if re.fullmatch(r"Contents/section\d+\.xml", n))
+        if not names:
+            raise ValueError("Contents/section*.xml이 없어 HWPX 형식이 아닙니다")
+        for name in names:
+            root = ET.fromstring(zf.read(name))
+            for el in root.iter():  # 문서 순서 순회 — 표 셀 문단도 제자리에서 등장
+                tag = el.tag.rsplit("}", 1)[-1]
+                if tag == "p":
+                    parts.append("\n")
+                elif tag == "t" and el.text:
+                    parts.append(el.text)
+    return "".join(parts).strip()
+
+
+def _extract_pdf(path: str) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            raise ValueError("암호화된 PDF는 지원하지 않습니다")
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
+
+
+def _extract_docx(path: str) -> str:
+    """DOCX 문단·표를 문서 순서대로 추출. 표는 행 단위로 셀을 ' | '로 잇는다."""
+    import docx
+    from docx.table import Table
+
+    doc = docx.Document(path)
+    parts: list[str] = []
+
+    def add_table(tb: Table) -> None:
+        for row in tb.rows:
+            parts.append(" | ".join(c.text.strip() for c in row.cells))
+
+    if hasattr(doc, "iter_inner_content"):
+        for item in doc.iter_inner_content():
+            if isinstance(item, Table):
+                add_table(item)
+            else:
+                parts.append(item.text)
+    else:  # 구버전 python-docx: 순서 보존 불가, 내용은 모두 수집
+        parts.extend(p.text for p in doc.paragraphs)
+        for tb in doc.tables:
+            add_table(tb)
+    return "\n".join(parts)
+
+
+_DOC_EXTRACTORS = {
+    "hwp": _extract_hwp,
+    "hwpx": _extract_hwpx,
+    "pdf": _extract_pdf,
+    "docx": _extract_docx,
+}
+
+
+@mcp.tool()
+async def fetch_job_document(file_url: str) -> str:
+    """채용공고 첨부파일(HWP/HWPX/PDF/DOCX)을 내려받아 본문 텍스트를 추출한다.
+
+    직무기술서·공고문 등 표 중심 문서의 표 안 텍스트도 함께 추출된다.
+
+    Args:
+        file_url: 첨부파일 다운로드 URL
+            (get_job_files 또는 get_alio_job_detail 결과의 첨부파일 URL)
+    """
+    try:
+        path, filename = await _download_doc(_normalize_doc_url(file_url))
+    except httpx.TimeoutException:
+        return "오류: 파일 다운로드가 30초를 초과했습니다."
+    except httpx.HTTPError as e:
+        return f"오류: 파일 다운로드 실패 - {e}"
+    except ValueError as e:
+        return f"오류: {e}"
+
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+        if head.lstrip()[:5].lower() in (b"<!doc", b"<html"):
+            return "오류: 다운로드 URL이 파일 대신 웹페이지(HTML)를 반환했습니다. URL을 확인하세요."
+        fmt = _detect_doc_format(path, filename)
+        if fmt is None:
+            return (
+                f"오류: 지원하지 않는 파일 형식입니다 (파일명: {filename or '알 수 없음'}). "
+                "지원 형식: .hwp .hwpx .pdf .docx"
+            )
+        try:
+            text = _DOC_EXTRACTORS[fmt](path)
+        except ValueError as e:
+            return f"오류: 텍스트 추출 불가 - {e}"
+        except Exception as e:
+            return f"오류: 텍스트 추출 실패 ({fmt}) - {type(e).__name__}: {e}"
+
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if not text:
+            return f"오류: 텍스트를 추출했지만 내용이 비어 있습니다 (형식: {fmt}, 이미지 스캔 문서일 수 있음)"
+
+        header = f"[문서: {filename or file_url} | 형식: {fmt} | {len(text):,}자]"
+        if len(text) > DOC_MAX_CHARS:
+            cut = len(text) - DOC_MAX_CHARS
+            text = text[:DOC_MAX_CHARS] + f"\n\n[주의: 문서가 길어 앞 {DOC_MAX_CHARS:,}자만 표시. 이후 {cut:,}자 절단됨]"
+        return f"{header}\n{text}"
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
