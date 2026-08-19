@@ -1140,6 +1140,39 @@ def _w24(row: dict[str, Any], *names: str) -> Any:
     return None
 
 
+def _ncs_match(req: str, course_cd: Any) -> tuple[int, str]:
+    """요청 NCS 코드와 과정 NCS 코드의 일치 수준을 (순위, 표시문구)로 반환한다.
+
+    분류 단계는 2자리씩(대>중>소>세)이므로 앞에서부터 일치하는 덩어리 수를 센다.
+    """
+    r = re.sub(r"\D", "", req or "")
+    c = re.sub(r"\D", "", str(course_cd or ""))
+    if not r or not c:
+        return (0, "")
+    depth = 0
+    for i in range(0, min(len(r), len(c), 8), 2):
+        if r[i : i + 2] == c[i : i + 2]:
+            depth += 1
+        else:
+            break
+    if depth >= 4:
+        return (4, "[세분류 일치 ✅]")
+    if depth == 3:
+        return (3, "[소분류 일치 🔶]")
+    if depth >= 1:
+        return (2, "[중분류 이하 일치 ⚠️]")
+    return (1, "[불일치 ❌]")
+
+
+def _num(value: Any) -> float:
+    """취업률·만족도 문자열을 정렬용 숫자로. 빈값은 -1(실적 없음)."""
+    s = re.sub(r"[^\d.]", "", str(value if value is not None else ""))
+    try:
+        return float(s) if s else -1.0
+    except ValueError:
+        return -1.0
+
+
 def _ncs_param(code: str) -> dict[str, str]:
     """NCS 코드를 srchNcs1 하나에 그대로 넣는다.
 
@@ -1217,6 +1250,11 @@ async def search_training_courses(
     page_size: int = 20,
 ) -> str:
     """고용24(국민내일배움카드) 훈련과정을 검색한다. 취업률·만족도·실훈련비까지 반환한다.
+
+    **용도**: 공공기관 입사지원서 교육사항의 직무관련성 인정은 과정 NCS 코드와 공고 직무
+    NCS 분류의 일치로 판단되는 경우가 많다 — **세분류 일치 과정을 우선 추천할 것.**
+    ncs_code로 검색하면 과정마다 일치 수준을 표시하고(세분류 ✅ / 소분류 🔶 /
+    중분류 이하 ⚠️ / 불일치 ❌), 일치 수준 → 취업률 → 만족도 순으로 정렬해 반환한다.
 
     Args:
         keyword: 과정명 검색어 (예: "회계실무", "연구행정")
@@ -1300,6 +1338,19 @@ async def search_training_courses(
     if fallback_note:
         lines.append(fallback_note.strip())
 
+    # ncs_code로 검색했으면 일치 수준 우선, 동급 내에서는 취업률·만족도 순으로 정렬
+    if ncs_code:
+        rows.sort(
+            key=lambda r: (
+                -_ncs_match(ncs_code, _w24(r, "ncsCd", "NCS_CD", "ncsCdNm"))[0],
+                -max(
+                    _num(_w24(r, "eiEmplRate6", "eiEmplCnt6Rate", "employ6Rate")),
+                    _num(_w24(r, "eiEmplRate3", "eiEmplCnt3Rate", "employ3Rate")),
+                ),
+                -_num(_w24(r, "grade", "stdgScor", "satisfaction")),
+            )
+        )
+
     for r in rows:
         title = _fmt_value(_w24(r, "title", "trprNm", "traProcessNm"))
         org = _fmt_value(_w24(r, "subTitle", "trainstCstNm", "traOrganNm"))
@@ -1307,7 +1358,9 @@ async def search_training_courses(
         sdt = _fmt_value(_w24(r, "traStartDate", "trStartDate", "traStDt"))
         edt = _fmt_value(_w24(r, "traEndDate", "trEndDate", "traEndDt"))
         gbn = _w24(r, "trainTarget", "trprGbn", "srchTraGbnNm")
-        ncs = _fmt_value(_w24(r, "ncsCd", "ncsCdNm", "ncsNm"))
+        ncs_raw = _w24(r, "ncsCd", "NCS_CD", "ncsCdNm", "ncsNm")
+        ncs = _fmt_value(ncs_raw)
+        badge = _ncs_match(ncs_code, ncs_raw)[1] if ncs_code else ""
         cost = _w24(r, "courseMan", "realMan")
         real = _w24(r, "realMan", "courseMan")
         emp3 = _w24(r, "eiEmplRate3", "eiEmplCnt3Rate", "employ3Rate")
@@ -1318,7 +1371,9 @@ async def search_training_courses(
         link = _w24(r, "titleLink", "trprLink")
         tid, tdeg = _w24(r, "trprId"), _w24(r, "trprDegr")
 
-        lines.append(f"\n■ {title}")
+        head = f"{badge} {title}" if badge else title
+        lines.append("")
+        lines.append(f"■ {head}")
         lines.append(f"  기관: {org} | 지역: {addr} | 기간: {sdt}~{edt}")
         extra = []
         if gbn:
