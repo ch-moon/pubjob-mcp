@@ -1119,5 +1119,235 @@ async def ncs_related_quals(ncs_cl_cd: str) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# 고용24 국민내일배움카드 훈련과정 (work24.go.kr)
+# ---------------------------------------------------------------------------
+
+WORK24_LIST_URL = "https://www.work24.go.kr/cm/openApi/call/hr/callOpenApiSvcInfo310L01.do"
+
+WORK24_AREA = {
+    "11": "서울", "26": "부산", "27": "대구", "28": "인천", "29": "광주", "30": "대전",
+    "31": "울산", "36": "세종", "41": "경기", "42": "강원", "43": "충북", "44": "충남",
+    "45": "전북", "46": "전남", "47": "경북", "48": "경남", "50": "제주",
+}
+
+
+def _w24(row: dict[str, Any], *names: str) -> Any:
+    """응답 필드명이 명세와 다를 수 있어 후보명을 순서대로 시도한다."""
+    for n in names:
+        if row.get(n) not in (None, ""):
+            return row[n]
+    return None
+
+
+def _ncs_param(code: str) -> dict[str, str]:
+    """NCS 코드를 srchNcs1 하나에 그대로 넣는다.
+
+    실측 결과 srchNcs1은 **가변길이 접두 코드**를 받는다 (2/4/6/8자리 모두 동작).
+    srchNcs2~4는 분류 단계가 아니라 각자 독립적인 대분류 필터로 동작하며 뒤에 온 값이
+    앞을 덮어쓰므로 사용하지 않는다. 자세한 근거는 README quirk 참조.
+    """
+    code = re.sub(r"\D", "", code or "")[:8]
+    return {"srchNcs1": code} if code else {}
+
+
+async def _call_work24(params: dict[str, Any]) -> dict[str, Any] | str:
+    """고용24 훈련과정 API 호출. 성공 시 JSON(dict), 실패 시 에러 메시지(str)."""
+    key = os.environ.get("WORK24_API_KEY")
+    if not key:
+        return "오류: 환경변수 WORK24_API_KEY가 비어 있습니다. .env 파일에 인증키를 입력하세요."
+    if "%" in key:
+        key = unquote(key)
+
+    query: dict[str, Any] = {"authKey": key, "returnType": "JSON", "outType": "1"}
+    query.update({k: v for k, v in params.items() if v not in (None, "")})
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(WORK24_LIST_URL, params=query)
+            resp.raise_for_status()
+    except httpx.TimeoutException:
+        return "오류: 고용24 API 응답이 10초를 초과했습니다."
+    except httpx.HTTPError as e:
+        return f"오류: 고용24 API 요청 실패 - {e}"
+
+    body = resp.text.strip()
+    if body[:1] not in ("{", "["):  # 인증 실패 시 XML/HTML 에러를 돌려주는 경우
+        return f"오류: JSON이 아닌 응답 (인증키·파라미터 확인) / 응답 일부: {body[:300]}"
+    try:
+        data = resp.json()
+    except ValueError as e:
+        return f"오류: JSON 파싱 실패 - {e} / 응답 일부: {body[:200]}"
+
+    if isinstance(data, dict):
+        # 일부 오픈API는 결과를 문자열 JSON으로 한 번 더 감싼다
+        inner = data.get("returnJSON")
+        if isinstance(inner, str):
+            try:
+                data = json.loads(inner)
+            except ValueError:
+                pass
+        msg = _w24(data, "errMsg", "message", "resultMsg")
+        code = str(_w24(data, "errCd", "resultCode") or "")
+        if msg and code not in ("", "0", "00", "000"):
+            return f"오류: 고용24 API 실패 응답 (code={code}, msg={msg})"
+    return data if isinstance(data, dict) else {"srchList": data}
+
+
+def _w24_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("srchList", "list", "items", "returnList"):
+        v = data.get(key)
+        if isinstance(v, list):
+            return [r for r in v if isinstance(r, dict)]
+        if isinstance(v, dict):
+            return [v]
+    return []
+
+
+@mcp.tool()
+async def search_training_courses(
+    keyword: str | None = None,
+    ncs_code: str | None = None,
+    online_only: bool = False,
+    course_type: str | None = None,
+    area: str | None = None,
+    org_name: str | None = None,
+    start_from: str | None = None,
+    start_to: str | None = None,
+    page_size: int = 20,
+) -> str:
+    """고용24(국민내일배움카드) 훈련과정을 검색한다. 취업률·만족도·실훈련비까지 반환한다.
+
+    Args:
+        keyword: 과정명 검색어 (예: "회계실무", "연구행정")
+        ncs_code: NCS 직무코드. **ncs_find_duty/ncs_duty_overview의 dutyCd를 그대로** 넣는다.
+            고용24의 ncsCd는 우리 dutyCd와 같은 8자리 체계라 코드가 그대로 통한다.
+            접두 검색이라 자릿수로 범위 조절 — "01"=사업관리 대분류 전체,
+            "0101"=중분류, "01010102"=프로젝트관리 세분류만.
+        online_only: True면 인터넷(원격) 과정만
+        course_type: 과정 구분 코드 — C0061S=구직자, C0061I=재직자,
+            C0104=K디지털트레이닝, C0105=K디지털기초역량, C0055=실업자원격
+        area: 지역 코드 — 11서울 26부산 27대구 28인천 29광주 30대전 31울산 36세종
+            41경기 42강원 43충북 44충남 45전북 46전남 47경북 48경남 50제주
+        start_from: 훈련 시작일 범위 시작 YYYYMMDD (기본 오늘)
+        start_to: 훈련 시작일 범위 끝 YYYYMMDD (기본 오늘+90일)
+        page_size: 결과 수 (기본 20, 최대 100)
+    """
+    today = date.today()
+    st = start_from or today.strftime("%Y%m%d")
+    ed = start_to or (today + timedelta(days=90)).strftime("%Y%m%d")
+    rows_n = max(1, min(page_size, 100))
+
+    params: dict[str, Any] = {
+        "srchTraStDt": st,
+        "srchTraEndDt": ed,
+        "sort": "ASC",
+        "sortCol": "2",
+        "pageNum": "1",
+        "pageSize": str(rows_n),
+        "srchTraProcessNm": keyword,
+        "srchTraOrganNm": org_name,
+        "crseTracseSe": course_type,
+        "srchTraArea1": area,
+    }
+    if online_only:
+        params["srchTraGbn"] = "M1005"
+    if ncs_code:
+        params.update(_ncs_param(ncs_code))
+
+    data = await _call_work24(params)
+    if isinstance(data, str):
+        return data
+    rows = _w24_rows(data)
+
+    # NCS 4단 분절 가설이 틀려 0건이면 대분류(srchNcs1)만으로 폴백한다
+    fallback_note = ""
+    if not rows and ncs_code and len(re.sub(r"\D", "", ncs_code)) > 2:
+        p2 = dict(params)
+        for i in (2, 3, 4):
+            p2.pop(f"srchNcs{i}", None)
+        data2 = await _call_work24(p2)
+        if not isinstance(data2, str):
+            rows2 = _w24_rows(data2)
+            if rows2:
+                data, rows = data2, rows2
+                fallback_note = (
+                    "\n※ NCS 4단 분절(srchNcs1~4) 검색은 0건이라 대분류(srchNcs1)만으로 재검색했습니다."
+                )
+
+    conds = [f"훈련시작일: {st}~{ed}"]
+    if keyword:
+        conds.append(f"과정명: {keyword}")
+    if ncs_code:
+        conds.append(f"NCS: {_ncs_param(ncs_code).get('srchNcs1', ncs_code)}")
+    if online_only:
+        conds.append("인터넷과정만")
+    if course_type:
+        conds.append(f"과정구분: {course_type}")
+    if area:
+        conds.append(f"지역: {WORK24_AREA.get(area, area)}")
+    if org_name:
+        conds.append(f"기관: {org_name}")
+    cond_text = " / ".join(conds)
+
+    if not rows:
+        return f"검색 결과 없음\n[검색 조건] {cond_text}{fallback_note}"
+
+    total = _w24(data, "scn_cnt", "totalCount", "cnt")
+    lines = [f"[검색 조건] {cond_text}"]
+    if total is not None:
+        lines.append(f"전체 {total}건 중 {len(rows)}건 표시")
+    if fallback_note:
+        lines.append(fallback_note.strip())
+
+    for r in rows:
+        title = _fmt_value(_w24(r, "title", "trprNm", "traProcessNm"))
+        org = _fmt_value(_w24(r, "subTitle", "trainstCstNm", "traOrganNm"))
+        addr = _fmt_value(_w24(r, "address", "addr", "trngAreaNm"))
+        sdt = _fmt_value(_w24(r, "traStartDate", "trStartDate", "traStDt"))
+        edt = _fmt_value(_w24(r, "traEndDate", "trEndDate", "traEndDt"))
+        gbn = _w24(r, "trainTarget", "trprGbn", "srchTraGbnNm")
+        ncs = _fmt_value(_w24(r, "ncsCd", "ncsCdNm", "ncsNm"))
+        cost = _w24(r, "courseMan", "realMan")
+        real = _w24(r, "realMan", "courseMan")
+        emp3 = _w24(r, "eiEmplRate3", "eiEmplCnt3Rate", "employ3Rate")
+        emp6 = _w24(r, "eiEmplRate6", "eiEmplCnt6Rate", "employ6Rate")
+        grade = _w24(r, "grade", "stdgScor", "satisfaction")
+        yard = _w24(r, "yardMan", "trainTargetCnt")
+        reg = _w24(r, "regCourseMan", "regCnt")
+        link = _w24(r, "titleLink", "trprLink")
+        tid, tdeg = _w24(r, "trprId"), _w24(r, "trprDegr")
+
+        lines.append(f"\n■ {title}")
+        lines.append(f"  기관: {org} | 지역: {addr} | 기간: {sdt}~{edt}")
+        extra = []
+        if gbn:
+            extra.append(f"구분: {_fmt_value(gbn)}")
+        if ncs != "-":
+            extra.append(f"NCS: {ncs}")
+        if cost is not None:
+            extra.append(f"수강비: {_fmt_value(cost)}원")
+        if real is not None:
+            extra.append(f"실훈련비: {_fmt_value(real)}원")
+        if extra:
+            lines.append("  " + " | ".join(extra))
+        perf = []
+        if emp3 is not None:
+            perf.append(f"취업률(3개월): {_fmt_value(emp3)}%")
+        if emp6 is not None:
+            perf.append(f"취업률(6개월): {_fmt_value(emp6)}%")
+        if grade is not None:
+            perf.append(f"만족도: {_fmt_value(grade)}")
+        if yard is not None or reg is not None:
+            perf.append(f"정원/신청: {_fmt_value(yard)}/{_fmt_value(reg)}")
+        if perf:
+            lines.append("  " + " | ".join(perf))
+        if link:
+            lines.append(f"  링크: {_fmt_value(link)}")
+        if tid:
+            lines.append(f"  (상세조회용) trprId={_fmt_value(tid)} trprDegr={_fmt_value(tdeg)}")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     mcp.run()  # stdio

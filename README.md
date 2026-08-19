@@ -20,6 +20,7 @@ Claude 등 MCP 클라이언트에서 국가·지방공무원, 공공기관, 교�
 | `ncs_duty_overview` | NCS | 세분류의 직무정의 + 능력단위 목록(정의·수준·ncsClCd) |
 | `ncs_analyze_unit` | NCS | 능력단위 상세 분석 — 요소별 수행준거·지식·기술·태도 + 직업기초능력 (옵션: 출제기준·평가지침) |
 | `ncs_related_quals` | NCS | 능력단위와 연계된 국가기술자격 종목 조회 (일 1000건 제한이라 결과 캐시) |
+| `search_training_courses` | 고용24 | 국민내일배움카드 훈련과정 검색 — NCS 코드·원격·과정구분·지역 필터, 취업률·만족도·실훈련비 포함 |
 
 기관구분·고용형태·NCS 등 검색 코드표는 각 도구의 docstring에 포함되어 있어
 MCP 클라이언트(LLM)가 바로 활용할 수 있다.
@@ -34,17 +35,19 @@ uv sync
 
 ### API 키 설정
 
-`.env` 파일을 만들고 인증키 2개를 넣는다 (Encoding/Decoding 키 아무거나 — 자동 판별):
+`.env` 파일을 만들고 인증키 3개를 넣는다 (Encoding/Decoding 키 아무거나 — 자동 판별):
 
 ```dotenv
 PUBJOB_API_KEY=나라일터_인증키
 ALIO_API_KEY=잡알리오_인증키
+WORK24_API_KEY=고용24_인증키
 ```
 
 | 키 | 발급처 |
 |---|---|
 | `PUBJOB_API_KEY` | [공공데이터포털(data.go.kr)](https://www.data.go.kr)에서 **"인사혁신처 공직 채용정보"** 검색 → 활용신청 |
 | `ALIO_API_KEY` | [잡알리오(job.alio.go.kr)](https://job.alio.go.kr) OpenAPI 메뉴에서 인증키 신청 |
+| `WORK24_API_KEY` | [고용24(work24.go.kr)](https://www.work24.go.kr) 오픈API 신청 (훈련과정 정보) |
 
 NCS 도구는 `PUBJOB_API_KEY`를 재사용한다 (같은 data.go.kr 키. 단, **"한국산업인력공단 NCS"**
 관련 API 두 건 — ncsInfo, 자격 연계 — 의 활용신청이 같은 계정에 있어야 한다).
@@ -129,7 +132,17 @@ claude mcp add pubjob -- uv run --directory /path/to/pubjob-mcp python main.py
 9. **자격 연계 API(ncsClCdJm)는 완전히 다른 규격** — 응답 envelope가 `data`/`dataInfo`가
    아니라 data.go.kr 표준(`header`/`body.items`)이고, 파라미터도 `returnType`이 아닌
    `dataFormat`이며, 페이지당 50건을 넘기면 `resultCode=930`으로 거부한다.
-10. **`/ncsjobInfo`의 직업기초능력 데이터는 2025.12 개편 전 구체계(10영역) 기준** —
+
+### 고용24 (work24.go.kr 훈련과정)
+
+10. **NCS 필터는 `srchNcs1` 하나만 쓴다 — `srchNcs2~4`는 계층이 아니다.** 명세상
+    `srchNcs1~4`가 대/중/소/세분류처럼 보이지만, 실측 결과 **`srchNcs1`이 가변길이
+    접두 코드를 받는다**(`01`=대분류 1,223건 / `01010102`=세분류 1,092건, 2·4·6·8자리 모두 동작).
+    `srchNcs2~4`는 각자 독립적인 대분류 필터로 동작하며 **뒤에 온 값이 앞을 덮어써서**,
+    `srchNcs1=01&srchNcs2=02`는 `srchNcs1=02`와 같은 결과(48,097건)를 낸다.
+    잘못 조합하면 필터가 무력화된 채 전체 결과가 나오므로 주의.
+    다행히 고용24의 `ncsCd`는 **NCS 표준 dutyCd와 같은 8자리 체계**라 코드가 그대로 통한다.
+11. **`/ncsjobInfo`의 직업기초능력 데이터는 2025.12 개편 전 구체계(10영역) 기준** —
     2025.12에 직업공통능력(7영역)으로 전면 개편됐지만 API와 각 기관 직무기술서는
     아직 구체계를 반환/사용하는 전환기다. 신체계 매핑은 본 저장소 스킬의
     `skills/job-analysis/references/직업공통능력_표준_2025.md` 대조표로 수행한다.
